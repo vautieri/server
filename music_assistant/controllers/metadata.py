@@ -45,6 +45,7 @@ from music_assistant_models.unique_list import UniqueList
 from music_assistant.constants import (
     CONF_LANGUAGE,
     DB_TABLE_ARTISTS,
+    DB_TABLE_GENRE_MEDIA_ITEM_MAPPING,
     DB_TABLE_PLAYLISTS,
     VARIOUS_ARTISTS_MBID,
     VARIOUS_ARTISTS_NAME,
@@ -456,7 +457,7 @@ class MetaDataController(CoreController):
             image_format = _detect_image_format(path)
         if provider == "builtin" and path.startswith("/collage/"):
             # special case for collage images
-            collage_rel = path.rsplit("/collage/", maxsplit=1)[-1]
+            collage_rel = path.split("/collage/")[-1]
             if not is_safe_path(collage_rel):
                 raise FileNotFoundError("Invalid collage path")
             path = os.path.join(self._collage_images_dir, collage_rel)
@@ -768,6 +769,7 @@ class MetaDataController(CoreController):
         if not (force_refresh or needs_refresh):
             return
         self.logger.debug("Updating metadata for Playlist %s", playlist.name)
+        playlist.metadata.genres = set()
         all_playlist_tracks_images: list[MediaItemImage] = []
         playlist_genres: dict[str, int] = {}
         # retrieve metadata for the playlist from the tracks (such as genres etc.)
@@ -782,14 +784,37 @@ class MetaDataController(CoreController):
                 )
             ):
                 all_playlist_tracks_images.append(track.image)
-            for genre in self.mass.music.playlists.get_track_genres(track):
+            if track.metadata.genres:
+                genres = track.metadata.genres
+            elif (
+                isinstance(track, Track)
+                and track.album
+                and isinstance(track.album, Album)
+                and track.album.metadata.genres
+            ):
+                genres = track.album.metadata.genres
+            else:
+                genres = set()
+            for genre in genres:
                 if genre not in playlist_genres:
                     playlist_genres[genre] = 0
                 playlist_genres[genre] += 1
             await asyncio.sleep(0)  # yield to eventloop
 
-        filtered_genres = self.mass.music.playlists.filter_playlist_genres(playlist_genres)
-        playlist.metadata.genres = filtered_genres
+        # filter genres based on playlist size: keep all for small playlists,
+        # require a minimum occurrence count for larger ones to reduce noise
+        total_genre_occurrences = sum(playlist_genres.values())
+        if total_genre_occurrences <= 20:
+            playlist_genres_filtered = set(playlist_genres.keys())
+        else:
+            min_count = min(5, total_genre_occurrences // 10)
+            playlist_genres_filtered = {
+                genre for genre, count in playlist_genres.items() if count > min_count
+            }
+        top_genres = sorted(
+            playlist_genres_filtered, key=lambda g: playlist_genres[g], reverse=True
+        )
+        playlist.metadata.genres.update(top_genres[:8])
         # create collage images
         cur_images: list[MediaItemImage] = playlist.metadata.images or []
         new_images = []
@@ -819,9 +844,51 @@ class MetaDataController(CoreController):
         # set timestamp, used to determine when this function was last called
         playlist.metadata.last_refresh = int(time())
         # update final item in library database
-        # use overwrite=True so genres (and other set fields) are replaced, not merged
+        await self.mass.music.playlists.update_item_in_library(playlist.item_id, playlist)
+
+    async def save_playlist_genres(self, playlist: Playlist, genre_counts: dict[str, int]) -> None:
+        """Filter and persist playlist genres from pre-computed counts.
+
+        Called from playlists.tracks() during force_refresh. Genres are collected
+        inline during track iteration to avoid a redundant second pass through
+        _update_playlist_metadata, which is throttled and subject to
+        REFRESH_INTERVAL, making it unsuitable for on-demand genre updates.
+
+        :param playlist: The library playlist to update.
+        :param genre_counts: Mapping of genre name to occurrence count.
+        """
+        # filter genres based on playlist size: keep all for small playlists,
+        # require a minimum occurrence count for larger ones to reduce noise
+        total = sum(genre_counts.values())
+        if total <= 20:
+            filtered = set(genre_counts.keys())
+        else:
+            min_count = min(5, total // 10)
+            filtered = {genre for genre, count in genre_counts.items() if count > min_count}
+        top_genres = sorted(filtered, key=lambda g: genre_counts[g], reverse=True)
+        new_genres = set(top_genres[:8])
+        # replace genre mappings before updating the library item, because the
+        # library update fires MEDIA_ITEM_UPDATED which the UI uses to re-fetch genres
+        playlist_id = int(playlist.item_id)
+        db = self.mass.music.database
+        await db.execute(
+            f"DELETE FROM {DB_TABLE_GENRE_MEDIA_ITEM_MAPPING} "
+            "WHERE media_id = :media_id AND media_type = :media_type",
+            {"media_id": playlist_id, "media_type": MediaType.PLAYLIST.value},
+        )
+        genre_controller = self.mass.music.genres
+        for genre_name in new_genres:
+            genre_ids = await genre_controller._find_genres_for_alias(genre_name)
+            for genre_id in genre_ids:
+                await genre_controller.add_media_mapping(
+                    genre_id, MediaType.PLAYLIST, playlist_id, alias=genre_name
+                )
+        # update the playlist's genres in the library database
+        # this fires MEDIA_ITEM_UPDATED so the UI refreshes with the new mappings
+        cur_item = await self.mass.music.playlists.get_library_item(playlist_id)
+        cur_item.metadata.genres = new_genres
         await self.mass.music.playlists.update_item_in_library(
-            playlist.item_id, playlist, overwrite=True
+            cur_item.item_id, cur_item, overwrite=True
         )
 
     async def _update_audiobook_metadata(
